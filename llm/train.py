@@ -84,7 +84,8 @@ def train(cfg: TrainConfig) -> None:
     # Optimizer
     optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=cfg.betas)
 
-    scaler = GradScaler(enabled=cfg.amp)
+    amp_enabled = cfg.amp and torch.cuda.is_available() and str(cfg.device).startswith("cuda")
+    scaler = GradScaler(enabled=amp_enabled)
 
     step = 0
     best_val = float("inf")
@@ -103,7 +104,7 @@ def train(cfg: TrainConfig) -> None:
             y = y.to(cfg.device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=cfg.amp):
+            with autocast(enabled=amp_enabled):
                 _, loss = model(x, y)
             scaler.scale(loss).backward()
             if cfg.grad_clip is not None and cfg.grad_clip > 0:
