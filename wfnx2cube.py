@@ -23,9 +23,11 @@ Usage:
 """
 
 import argparse
+import gzip
 import math
+import re
 import sys
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import xml.etree.ElementTree as ET
 
 
@@ -151,29 +153,111 @@ def text_to_floats(text: str) -> List[float]:
 
 
 def parse_wfx(path: str) -> Wavefunction:
+    # Load bytes, support gzip, strip leading noise, and legalize tag names with spaces
     try:
-        tree = ET.parse(path)
+        with open(path, 'rb') as fb:
+            raw = fb.read()
     except Exception as e:
-        raise WFXParseError(f"Failed to parse XML: {e}")
-    root = tree.getroot()
+        raise WFXParseError(f"Failed to read file: {e}")
 
-    # Names in WFX are often within tags like <NumberOfNuclei>, <AtomZ>, <NuclearCartesianCoordinates>
-    def find_text(tag: str) -> Optional[str]:
-        el = root.find(tag)
-        return el.text if el is not None and el.text is not None else None
+    if len(raw) >= 2 and raw[0] == 0x1F and raw[1] == 0x8B:
+        try:
+            raw = gzip.decompress(raw)
+        except Exception as e:
+            raise WFXParseError(f"Failed to decompress gzip WFX: {e}")
+
+    # Strip any bytes before first '<'
+    lt = raw.find(b'<')
+    if lt > 0:
+        raw = raw[lt:]
+
+    # Try parse as-is first
+    text_variants: List[Tuple[str, str]] = []  # (label, text)
+    for enc in ('utf-8', 'utf-16', 'utf-16le', 'latin-1'):
+        try:
+            text_variants.append((enc, raw.decode(enc)))
+        except Exception:
+            continue
+
+    last_err = None
+    root = None
+
+    def legalize_tag_spaces(s: str) -> str:
+        # Convert tags like <Number of Nuclei> to <NumberOfNuclei>
+        tag_re = re.compile(r'<\s*/?\s*([^>]+?)\s*>')
+        def repl(m: re.Match) -> str:
+            inner = m.group(1)
+            sin = inner.strip()
+            if not sin:
+                return m.group(0)
+            if sin[0] in ('?', '!'):
+                return m.group(0)
+            closing = sin.startswith('/')
+            if closing:
+                sin = sin[1:].strip()
+            # If attributes are present, leave unchanged
+            if ('=' in sin) or ('"' in sin) or ("'" in sin):
+                return m.group(0)
+            name = sin.replace(' ', '')
+            return f"<{('/' if closing else '')}{name}>"
+        return tag_re.sub(repl, s)
+
+    def norm_tag(tag: str) -> str:
+        # Remove namespace and non-alnum, uppercase
+        if '}' in tag:
+            tag = tag.split('}', 1)[1]
+        return ''.join(ch for ch in tag if ch.isalnum()).upper()
+
+    def collect_texts(r: ET.Element) -> Dict[str, str]:
+        d: Dict[str, str] = {}
+        for el in r.iter():
+            key = norm_tag(el.tag)
+            txt = ''.join(el.itertext()) if el.text is not None else (''.join(el.itertext()) if list(el) else '')
+            if txt is None:
+                txt = ''
+            d[key] = txt
+        return d
+
+    # Attempt parse with raw text variants; then with legalized tags
+    for label, txt in text_variants:
+        try:
+            root = ET.fromstring(txt)
+            tag_texts = collect_texts(root)
+            break
+        except Exception as e:
+            last_err = e
+            # Try legalized version
+            try:
+                fixed = legalize_tag_spaces(txt)
+                root = ET.fromstring(fixed)
+                tag_texts = collect_texts(root)
+                break
+            except Exception as e2:
+                last_err = e2
+                continue
+
+    if root is None:
+        raise WFXParseError(f"Failed to parse XML: {last_err}")
+
+    def get_text_any(names: List[str]) -> Optional[str]:
+        for nm in names:
+            key = ''.join(ch for ch in nm if ch.isalnum()).upper()
+            if key in tag_texts and tag_texts[key].strip():
+                return tag_texts[key]
+        return None
 
     # Atoms
-    z_text = find_text('AtomZ') or find_text('NuclearCharge')
+    z_text = get_text_any(['AtomicNumbers', 'AtomZ', 'NuclearCharges', 'NuclearCharge'])
     if not z_text:
-        raise WFXParseError("Missing AtomZ/NuclearCharge in WFX")
+        raise WFXParseError("Missing atomic numbers/charges in WFX")
     zs = [int(round(v)) for v in text_to_floats(z_text)]
 
-    coords_text = find_text('NuclearCartesianCoordinates') or find_text('NuclearCoordinates')
+    coords_text = get_text_any(['NuclearCartesianCoordinates', 'NuclearCoordinates', 'AtomCartesianCoordinates'])
     if not coords_text:
-        raise WFXParseError("Missing NuclearCartesianCoordinates in WFX")
+        raise WFXParseError("Missing nuclear coordinates in WFX")
     coords = text_to_floats(coords_text)
     if len(coords) % 3 != 0:
-        raise WFXParseError("NuclearCartesianCoordinates length is not a multiple of 3")
+        raise WFXParseError("Nuclear coordinates length is not a multiple of 3")
     if len(coords) // 3 != len(zs):
         raise WFXParseError("Mismatch between number of nuclei and coordinates")
 
@@ -182,17 +266,15 @@ def parse_wfx(path: str) -> Wavefunction:
         x, y, zc = coords[3 * i], coords[3 * i + 1], coords[3 * i + 2]
         atoms.append(Atom(Z, float(Z), x, y, zc))
 
-    # Basis: contraction shells
-    # Expect these arrays: CenterIndex, AngularMomentum (per shell), NumberOfPrimitives (per shell), 
-    # PrimitiveExponents (concatenated), ContractionCoefficients (concatenated)
-    centers_text = find_text('ShellToNucleus') or find_text('CenterIndex')
-    L_text = find_text('ShellAngularMomentum') or find_text('AngularMomentum')
-    nprim_text = find_text('NumberOfPrimitives')
-    exp_text = find_text('PrimitiveExponents')
-    coef_text = find_text('ContractionCoefficients') or find_text('ContractionCoefficientsNormalized')
+    # Basis arrays
+    centers_text = get_text_any(['ShellToAtomMap', 'ShellToNucleus', 'CenterIndex'])
+    L_text = get_text_any(['ShellTypes', 'ShellAngularMomentum', 'AngularMomentum'])
+    nprim_text = get_text_any(['NumberOfPrimitivesPerShell', 'NumberOfPrimitives'])
+    exp_text = get_text_any(['PrimitiveGaussianExponents', 'PrimitiveExponents'])
+    coef_text = get_text_any(['ContractionCoefficients', 'ContractionCoefficientsNormalized'])
 
     if not (centers_text and L_text and nprim_text and exp_text and coef_text):
-        raise WFXParseError("Missing basis set arrays (ShellToNucleus, ShellAngularMomentum, NumberOfPrimitives, PrimitiveExponents, ContractionCoefficients)")
+        raise WFXParseError("Missing basis arrays (centers, L, nprims, exponents, coefficients)")
 
     centers = [int(round(v)) for v in text_to_floats(centers_text)]
     Ls = [int(round(v)) for v in text_to_floats(L_text)]
@@ -206,6 +288,8 @@ def parse_wfx(path: str) -> Wavefunction:
     shells: List[Shell] = []
     off = 0
     for ci, L, np in zip(centers, Ls, nprims):
+        if L < 0:
+            raise WFXParseError("SP shells (L<0) not supported in this version")
         if L > 2:
             raise WFXParseError("Only S/P/D shells supported in this version")
         part_exps = exps[off: off + np]
@@ -215,7 +299,7 @@ def parse_wfx(path: str) -> Wavefunction:
         shells.append(Shell(ci - 1, L, part_exps, part_coefs))
         off += np
 
-    # Expand shells to Cartesian AO functions
+    # Expand shells
     def expand_shell(shell: Shell) -> List[AOFunction]:
         aos: List[AOFunction] = []
         L = shell.L
@@ -226,7 +310,6 @@ def parse_wfx(path: str) -> Wavefunction:
             aos.append(AOFunction(shell.center_index, 0, 1, 0, shell.exponents, shell.coeffs))
             aos.append(AOFunction(shell.center_index, 0, 0, 1, shell.exponents, shell.coeffs))
         elif L == 2:
-            # 6 Cartesian d functions: xx, yy, zz, xy, xz, yz
             aos.append(AOFunction(shell.center_index, 2, 0, 0, shell.exponents, shell.coeffs))
             aos.append(AOFunction(shell.center_index, 0, 2, 0, shell.exponents, shell.coeffs))
             aos.append(AOFunction(shell.center_index, 0, 0, 2, shell.exponents, shell.coeffs))
@@ -241,45 +324,52 @@ def parse_wfx(path: str) -> Wavefunction:
     for sh in shells:
         aos.extend(expand_shell(sh))
 
-    # Molecular orbitals
-    # Expect: <NumberOfMOs>, <OccupationNumbers>, <MOLECULAR_ORBITALS><MO>...</MO></MOLECULAR_ORBITALS>
-    occ_text = find_text('OccupationNumbers') or find_text('MOOccupation')
+    # MOs
+    occ_text = get_text_any(['OccupationNumbers', 'MOOccupation', 'Occupations', 'OccupancyNumbers'])
     if not occ_text:
-        raise WFXParseError("Missing OccupationNumbers")
+        raise WFXParseError("Missing MO occupation numbers")
     occs = text_to_floats(occ_text)
 
-    # MO coefficients typically stored as concatenated blocks per MO
-    coeffs_text = find_text('MOCoefficients') or find_text('CoefficientMatrix')
-    if not coeffs_text:
-        # Try nested MO blocks
-        mos: List[MolecularOrbital] = []
-        mo_nodes = root.findall('MolecularOrbitals/MO') or root.findall('MO')
-        if not mo_nodes:
-            raise WFXParseError("Missing MO coefficients")
-        for i, mo_node in enumerate(mo_nodes):
-            e_txt = (mo_node.findtext('Energy') or '0.0')
-            c_txt = (mo_node.findtext('Coefficients') or '')
-            coeffs = text_to_floats(c_txt)
-            if len(coeffs) != len(aos):
-                raise WFXParseError(f"MO {i+1} coefficient length {len(coeffs)} != AO count {len(aos)}")
-            occ = occs[i] if i < len(occs) else (2.0 if i*2 < len(occs) else 0.0)
-            energy = float(e_txt.replace('D','E')) if e_txt else 0.0
-            mos.append(MolecularOrbital(energy, occ, coeffs))
-    else:
+    coeffs_text = get_text_any(['MOCoefficients', 'CoefficientMatrix'])
+    mos: List[MolecularOrbital]
+    if coeffs_text:
         flat = text_to_floats(coeffs_text)
         nao = len(aos)
-        nm = len(occs)
+        if nao == 0:
+            raise WFXParseError("No AOs constructed from basis")
         if len(flat) % nao != 0:
             raise WFXParseError("Coefficient matrix length not divisible by AO count")
-        nm_guess = len(flat) // nao
-        if nm != nm_guess:
-            # Use nm_guess as count, but occupancies may be length nm
-            nm = nm_guess
+        nm = len(flat) // nao
         mos = []
         for i in range(nm):
             vec = flat[i * nao:(i + 1) * nao]
             occ = occs[i] if i < len(occs) else (2.0 if i * 2 < len(occs) else 0.0)
             mos.append(MolecularOrbital(0.0, occ, vec))
+    else:
+        # Try nested MO nodes, ignoring namespaces and name variations
+        def is_mo_node(el: ET.Element) -> bool:
+            t = norm_tag(el.tag)
+            return t in ( 'MO', 'MOLECULARORBITAL', 'ORBITAL' )
+        mo_nodes = [el for el in root.iter() if is_mo_node(el)]
+        if not mo_nodes:
+            raise WFXParseError("Missing MO coefficients")
+        mos = []
+        for i, mo in enumerate(mo_nodes):
+            # Gather child texts
+            child_map: Dict[str, str] = {}
+            for ch in mo.iter():
+                child_map[norm_tag(ch.tag)] = ''.join(ch.itertext()) if ch.text is not None else ''.join(ch.itertext())
+            e_txt = child_map.get('ENERGY', '0.0')
+            c_txt = child_map.get('COEFFICIENTS', '') or child_map.get('MOCOEFFICIENTS', '')
+            coeffs = text_to_floats(c_txt)
+            if len(coeffs) != len(aos):
+                raise WFXParseError(f"MO {i+1} coefficient length {len(coeffs)} != AO count {len(aos)}")
+            occ = occs[i] if i < len(occs) else (2.0 if i * 2 < len(occs) else 0.0)
+            try:
+                energy = float(e_txt.replace('D', 'E')) if e_txt else 0.0
+            except Exception:
+                energy = 0.0
+            mos.append(MolecularOrbital(energy, occ, coeffs))
 
     return Wavefunction(atoms, aos, mos)
 
